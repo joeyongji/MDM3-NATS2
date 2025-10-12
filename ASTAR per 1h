@@ -1,0 +1,106 @@
+# —— 物理距离（km）
+EARTH_RADIUS_KM = 6371.0
+def haversine_km(lon1, lat1, lon2, lat2):
+    rlat1 = math.radians(lat1); rlat2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(rlat1)*math.cos(rlat2)*math.sin(dlon/2)**2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+def phys_km_between(a, b):
+    lon1, lat1 = idx_to_phys_x(a[0]), idx_to_phys_y(a[1])
+    lon2, lat2 = idx_to_phys_x(b[0]), idx_to_phys_y(b[1])
+    return haversine_km(lon1, lat1, lon2, lat2)
+
+# —— 取“朝向最终目标的 900km 子目标”（若剩余不足900则直接终点）
+def choose_window_goal(current, final_goal, window_km, mask, max_snap=4):
+    total_km = phys_km_between(current, final_goal)
+    if total_km <= window_km:
+        return final_goal
+    t = window_km / total_km
+    xf = current[0] + t * (final_goal[0] - current[0])
+    yf = current[1] + t * (final_goal[1] - current[1])
+    zf = current[2] + t * (final_goal[2] - current[2])
+    # 就近贴回可通行网格
+    xi, yi, zi = int(round(xf)), int(round(yf)), int(round(zf))
+    for r in range(max_snap+1):
+        for dx in range(-r, r+1):
+            for dy in range(-r, r+1):
+                for dz in range(-r, r+1):
+                    nx, ny, nz = xi+dx, yi+dy, zi+dz
+                    if in_bounds(nx, ny, nz) and passable(nx, ny, nz, mask):
+                        return (nx, ny, nz)
+    return final_goal
+
+# —— 计算从 u->v 这一步的“模型时间”（与 A* 保持一致的近似）
+def step_time_units(u_node, v_node):
+    ux, uy, uz = u_node
+    vx, vy, vz = v_node
+    dx, dy, dz = vx-ux, vy-uy, vz-uz
+    dist = math.sqrt(dx*dx + dy*dy + dz*dz)  # 索引距离
+    if dist == 0:
+        return 0.0
+    # 与 A* 相同：在起点取风并投影到水平航向
+    u_wind, v_wind = get_wind_uv(ux, uy, uz)
+    ex, ey = dx/dist, dy/dist
+    Vg = TAS + (u_wind*ex + v_wind*ey)
+    Vg = max(1e-3, Vg)
+    Vg = max(0.05, Vg)
+    return dist / Vg
+
+# —— 按“飞行固定时长”沿路径前进，返回：到达节点索引 & 已用时（模型单位）
+def advance_along_path_by_time(path, time_budget_units):
+    if not path or len(path) < 2:
+        return 0, 0.0
+    used = 0.0
+    for i in range(len(path)-1):
+        dt = step_time_units(path[i], path[i+1])
+        if used + dt > time_budget_units:
+            # 在这一条边上耗尽预算：保守起见，停在 path[i+1] 这个网格点
+            return i+1, used+dt
+        used += dt
+    return len(path)-1, used  # 路径末端
+
+# —— 主循环：窗口=900km；每飞 1 小时重规划
+WINDOW_KM = 900.0
+
+# ⚠️ 设定“模型时间单位”对应的小时数（自行按需要调整）
+# 例如：如果你希望“模型 1 个时间单位 = 0.25 小时（15分钟）”，则 TIME_UNIT_HOURS = 0.25
+TIME_UNIT_HOURS = 1.0
+ONE_HOUR_IN_TIME_UNITS = 1.0 / TIME_UNIT_HOURS  # 1 小时等于多少“模型时间单位”
+
+def rolling_plan_by_hour(start, final_goal, mask, max_iters=1000):
+    curr = start
+    traj = [curr]
+    total_hours = 0.0
+    iter_idx = 0
+    while curr != final_goal and iter_idx < max_iters:
+        iter_idx += 1
+        subgoal = choose_window_goal(curr, final_goal, WINDOW_KM, mask)
+        path, cost, dist, _ = astar_3d(curr, subgoal, mask)
+        if not path:
+            print(f"[终止] 第 {iter_idx} 次规划失败（{curr} -> {subgoal}）。")
+            break
+        # 沿本段最优路径前进 1 小时
+        step_idx, used_time_units = advance_along_path_by_time(path, ONE_HOUR_IN_TIME_UNITS)
+        curr = path[step_idx]
+        traj.extend(path[1:step_idx+1])
+        total_hours += 1.0
+        print(f"[{iter_idx:02d}] 飞行 1h 后到达 {curr}，距终点 ~{phys_km_between(curr, final_goal):.1f} km")
+        if curr == final_goal:
+            print("[完成] 抵达终点。")
+            break
+    return traj, total_hours
+
+# —— 运行滚动规划（以“有禁飞”的图为例）
+rolling_traj, hours_flown = rolling_plan_by_hour(start_point, goal_point, blocked)
+
+# —— 可视化滚动轨迹（追加一条线）
+if rolling_traj and len(rolling_traj) > 1:
+    ax.plot([idx_to_phys_x(x) for x,y,z in rolling_traj],
+            [idx_to_phys_y(y) for x,y,z in rolling_traj],
+            [idx_to_phys_z(z) for x,y,z in rolling_traj],
+            linewidth=2, alpha=0.9, label="Rolling 900km / 1h replanning")
+    ax.legend(loc='upper left')
+    plt.tight_layout()
+    plt.show()
