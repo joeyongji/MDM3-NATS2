@@ -50,47 +50,93 @@ def step_time_units(u_node, v_node):
 
 # —— 按“飞行固定时长”沿路径前进，返回：到达节点索引 & 已用时（模型单位）
 def advance_along_path_by_time(path, time_budget_units):
-    if not path or len(path) < 2:
-        return 0, 0.0
+    """
+    输入:
+      path: 节点序列
+      time_budget_units: 这次可用的模型时间预算
+    输出:
+      step_idx: 在 path 上停下来的节点索引（不跨越会超时的下一条边）
+      used:     实际消耗的模型时间
+      reached_end: 是否走到了 path 终点（即到达本段子目标）
+    """
+    if not path or len(path) < 2 or time_budget_units <= 0:
+        return 0, 0.0, len(path) <= 1
+
     used = 0.0
-    for i in range(len(path)-1):
-        dt = step_time_units(path[i], path[i+1])
+    for i in range(len(path) - 1):
+        dt = step_time_units(path[i], path[i + 1])
+        # 下一条边会超时 -> 不跨越，停在当前节点 i
         if used + dt > time_budget_units:
-            # 在这一条边上耗尽预算：保守起见，停在 path[i+1] 这个网格点
-            return i+1, used+dt
+            return i, used, False
         used += dt
-    return len(path)-1, used  # 路径末端
+
+    # 全部边都走完 -> 到达子目标
+    return len(path) - 1, used, True
+
 
 # —— 主循环：窗口=900km；每飞 1 小时重规划
 WINDOW_KM = 900.0
 
-# ⚠️ 设定“模型时间单位”对应的小时数（自行按需要调整）
+
 # 例如：如果你希望“模型 1 个时间单位 = 0.25 小时（15分钟）”，则 TIME_UNIT_HOURS = 0.25
 TIME_UNIT_HOURS = 1.0
 ONE_HOUR_IN_TIME_UNITS = 1.0 / TIME_UNIT_HOURS  # 1 小时等于多少“模型时间单位”
 
-def rolling_plan_by_hour(start, final_goal, mask, max_iters=1000):
+def rolling_plan_by_hour(start, final_goal, mask, max_hours=1000, verbose=True):
+    """
+    每个外层循环代表“消耗最多 1 小时”。这一小时内可多次：
+      选 900km 子目标 -> A* -> 在剩余时间内推进 -> 若提前到子目标继续下一段
+    """
     curr = start
     traj = [curr]
-    total_hours = 0.0
-    iter_idx = 0
-    while curr != final_goal and iter_idx < max_iters:
-        iter_idx += 1
-        subgoal = choose_window_goal(curr, final_goal, WINDOW_KM, mask)
-        path, cost, dist, _ = astar_3d(curr, subgoal, mask)
-        if not path:
-            print(f"[终止] 第 {iter_idx} 次规划失败（{curr} -> {subgoal}）。")
-            break
-        # 沿本段最优路径前进 1 小时
-        step_idx, used_time_units = advance_along_path_by_time(path, ONE_HOUR_IN_TIME_UNITS)
-        curr = path[step_idx]
-        traj.extend(path[1:step_idx+1])
-        total_hours += 1.0
-        print(f"[{iter_idx:02d}] 飞行 1h 后到达 {curr}，距终点 ~{phys_km_between(curr, final_goal):.1f} km")
-        if curr == final_goal:
-            print("[完成] 抵达终点。")
-            break
-    return traj, total_hours
+    hours_acc = 0.0
+    hour_idx = 0
+    EPS = 1e-9
+
+    while curr != final_goal and hour_idx < max_hours:
+        hour_idx += 1
+        remaining = ONE_HOUR_IN_TIME_UNITS
+        inner_calls = 0
+
+        while remaining > EPS and curr != final_goal:
+            inner_calls += 1
+
+            # 选择 900km 子目标（或不足 900km 时直接用最终目标）
+            subgoal = choose_window_goal(curr, final_goal, WINDOW_KM, mask)
+            path, cost, dist, _ = astar_3d(curr, subgoal, mask)
+            if not path:
+                print(f"[终止] 无法从 {curr} 规划至 {subgoal}。")
+                return traj, hours_acc
+
+            step_idx, used, reached_subgoal = advance_along_path_by_time(path, remaining)
+
+            # 沿当前段推进（不重复起点）
+            if step_idx >= 1:
+                traj.extend(path[1:step_idx + 1])
+                curr = path[step_idx]
+
+            remaining -= used
+
+            if verbose:
+                print(f"  ├─ 段内第 {inner_calls} 次：耗时 {used:.3f} tu，"
+                      f"到达 {curr}，距终点 {phys_km_between(curr, final_goal):.1f} km，"
+                      f"小时剩余 {remaining:.3f} tu")
+
+            # 防死循环：如果一条边都走不了（dt > 剩余预算且严格不超时），提早结束本小时
+            if used <= EPS and not reached_subgoal:
+                if verbose:
+                    print("  └─ 剩余预算不足以通过下一条边，提前结束当前小时。")
+                break
+
+        hours_acc += 1.0
+        if verbose:
+            print(f"[{hour_idx:02d}] 本小时结束：位置 {curr}，距终点 ~{phys_km_between(curr, final_goal):.1f} km")
+
+    if curr == final_goal:
+        print("[完成] 抵达终点。")
+
+    return traj, hours_acc
+
 
 # —— 运行滚动规划（以“有禁飞”的图为例）
 rolling_traj, hours_flown = rolling_plan_by_hour(start_point, goal_point, blocked)
