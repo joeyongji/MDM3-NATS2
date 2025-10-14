@@ -1,0 +1,458 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from heapq import heappush, heappop
+import random
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import math
+
+# -----------------------------
+# 基本参数
+# -----------------------------
+np.random.seed(53)
+
+Nx, Ny, Nz = 15, 15, 5
+
+# 地图坐标轴（仅用于可视化标签）
+lon_min, lon_max = -70.0, -10.0
+lat_min, lat_max =  40.0,  60.0
+alt_min, alt_max = 30000.0, 38000.0
+lon_vals = np.linspace(lon_min, lon_max, Nx)
+lat_vals = np.linspace(lat_min, lat_max, Ny)
+alt_vals = np.linspace(alt_min, alt_max, Nz)
+
+def idx_to_phys_x(ix): return np.interp(ix, np.arange(Nx), lon_vals)
+def idx_to_phys_y(iy): return np.interp(iy, np.arange(Ny), lat_vals)
+def idx_to_phys_z(iz): return np.interp(iz, np.arange(Nz), alt_vals)
+
+# -----------------------------
+# 索引空间内的实心球禁飞区
+# -----------------------------
+def generate_spherical_mask_index(Nx, Ny, Nz, k_min=2, k_max=4):
+    if Nx < 4 or Ny < 4 or Nz < 2:
+        raise ValueError("Grid too small")
+    k = np.random.randint(k_min, k_max + 1)
+    Z, Y, X = np.ogrid[:Nz, :Ny, :Nx]
+    mask = np.zeros((Nz, Ny, Nx), dtype=bool)
+    spheres_idx = []
+    for _ in range(k):
+        cx = np.random.randint(Nx // 3, 2 * Nx // 3)
+        cy = np.random.randint(Ny // 3, 2 * Ny // 3)
+        cz = np.random.randint(1, Nz - 1)
+        r  = np.random.randint(1, max(2, min(Nx, Ny) // 5))
+        mask |= (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2 <= r ** 2
+        spheres_idx.append((cx, cy, cz, r))
+    return mask, spheres_idx
+
+blocked, spheres_idx = generate_spherical_mask_index(Nx, Ny, Nz)
+
+# -----------------------------
+# 26 邻接动作集合（索引空间步进）
+# -----------------------------
+moves = []
+for dx in (-1, 0, 1):
+    for dy in (-1, 0, 1):
+        for dz in (-1, 0, 1):
+            if dx == dy == dz == 0:
+                continue
+            # dist 不再用于物理距离，仅保留方向
+            moves.append((dx, dy, dz, 0.0))
+
+def in_bounds(ix, iy, iz): return 0 <= ix < Nx and 0 <= iy < Ny and 0 <= iz < Nz
+def passable(ix, iy, iz, mask): return not mask[iz, iy, ix]
+
+# -----------------------------
+# 速度与风场（物理单位）
+# -----------------------------
+# 若 TIME_UNIT_HOURS = 1.0，则等同于 km/h
+TAS = 900.0  # 巡航空速（km / 时间单位）
+
+# 各高度层基础风（km / 时间单位），可按需要调整
+u_layer = np.array([+20.0, +40.0, +80.0, +40.0, +10.0])   # 东西向（+为向东）
+v_layer = np.array([  0.0, -10.0,   0.0, +10.0,   0.0])   # 南北向（+为向北）
+
+# 急流（叠加到 u），峰值 km / 时间单位（数量级 100~200 比较明显）
+A_JET     = 150.0
+Y0_JET    = (Ny - 1) / 2.0
+SIGMA_JET = Ny / 6.0
+
+def u_jet(y):
+    return A_JET * math.exp(-((y - Y0_JET) ** 2) / (2.0 * SIGMA_JET ** 2))
+
+def get_wind_uv(ix, iy, iz):
+    """返回 (u_total, v_total) in km/时间单位（水平风）"""
+    u = float(u_layer[iz]) + u_jet(iy)
+    v = float(v_layer[iz])
+    return u, v
+
+# -----------------------------
+# 物理空间换算工具
+# -----------------------------
+DEG2KM_LAT = 111.0  # 每度纬度~111km
+FT_TO_KM = 0.0003048
+
+def lonlat_of(ix, iy):
+    return idx_to_phys_x(ix), idx_to_phys_y(iy)
+
+def east_north_km_between(ix1, iy1, ix2, iy2):
+    """返回从(i1,j1)到(i2,j2)在水平面的东向/北向位移 (km, km)"""
+    lon1, lat1 = lonlat_of(ix1, iy1)
+    lon2, lat2 = lonlat_of(ix2, iy2)
+    # 采用中纬度余弦近似（网格不大时足够）
+    lat_mid = math.radians(0.5 * (lat1 + lat2))
+    dlon_deg = (lon2 - lon1)
+    dlat_deg = (lat2 - lat1)
+    east_km  = dlon_deg * DEG2KM_LAT * math.cos(lat_mid)  # ≈ Δlon° * 111km * cos(lat)
+    north_km = dlat_deg * DEG2KM_LAT                      # ≈ Δlat° * 111km
+    return east_km, north_km
+
+def horiz_km_between(ix1, iy1, ix2, iy2):
+    ex, ny = east_north_km_between(ix1, iy1, ix2, iy2)
+    return math.hypot(ex, ny)
+
+def vert_km_between(iz1, iz2):
+    z1_km = idx_to_phys_z(iz1) * FT_TO_KM
+    z2_km = idx_to_phys_z(iz2) * FT_TO_KM
+    return abs(z2_km - z1_km)
+
+def phys3d_km_between(a, b):
+    """3D物理距离：√(水平^2 + 垂直^2)"""
+    ix1, iy1, iz1 = a
+    ix2, iy2, iz2 = b
+    h = horiz_km_between(ix1, iy1, ix2, iy2)
+    v = vert_km_between(iz1, iz2)
+    return math.hypot(h, v)
+
+# -----------------------------
+# 启发函数设置（基于物理速度上界）
+# -----------------------------
+max_wind_mag = 0.0
+for z in range(Nz):
+    u_peak = u_layer[z] + A_JET
+    v_val  = v_layer[z]
+    max_wind_mag = max(max_wind_mag, math.hypot(u_peak, v_val))
+
+K_HEUR = 0.5 + 0.5 / (TAS + max_wind_mag)   # h = dist_km * K_HEUR
+
+def heuristic(a, b):
+    return phys3d_km_between(a, b) * K_HEUR
+
+# -----------------------------
+# 邻居（返回物理距离与水平 EN 分量）
+# -----------------------------
+def neighbors(ix, iy, iz, mask):
+    for dx, dy, dz, _ in moves:
+        nx, ny, nz = ix + dx, iy + dy, iz + dz
+        if in_bounds(nx, ny, nz) and passable(nx, ny, nz, mask):
+            dist_km = phys3d_km_between((ix, iy, iz), (nx, ny, nz))
+            east_km, north_km = east_north_km_between(ix, iy, nx, ny)
+            yield nx, ny, nz, dist_km, east_km, north_km
+
+# -----------------------------
+# 起终点生成
+# -----------------------------
+def random_free_cell(mask, margin=1, min_dist=5):
+    if Nx <= 2 * margin or Ny <= 2 * margin:
+        margin = 0
+    for _ in range(20000):
+        ix = np.random.randint(margin, Nx - margin) if Nx > 2 * margin else np.random.randint(0, Nx)
+        iy = np.random.randint(margin, Ny - margin) if Ny > 2 * margin else np.random.randint(0, Ny)
+        iz = np.random.randint(0, Nz)
+        if passable(ix, iy, iz, mask):
+            for _ in range(2000):
+                jx = np.random.randint(margin, Nx - margin) if Nx > 2 * margin else np.random.randint(0, Nx)
+                jy = np.random.randint(margin, Ny - margin) if Ny > 2 * margin else np.random.randint(0, Ny)
+                jz = np.random.randint(0, Nz)
+                dist_val = phys3d_km_between((ix, iy, iz), (jx, jy, jz))
+                # 这里 min_dist 仍然按“索引格距”起到“相隔足够远”的作用；不严格物理，无伤大雅
+                if passable(jx, jy, jz, mask) and dist_val >= min_dist:
+                    return (ix, iy, iz), (jx, jy, jz)
+    raise RuntimeError("No valid start-goal pair found.")
+
+# -----------------------------
+# A*（物理距离 & 物理速度）
+# -----------------------------
+def astar_3d(start, goal, mask):
+    openh = []
+    heappush(openh, (0.0, start))
+    g = {start: 0.0}         # 累计代价（0.5*距离km + 0.5*时间）
+    g_dist = {start: 0.0}    # 累计距离（km）
+    parent = {start: None}
+    closed = set()
+
+    EPS = 1e-6
+    VMIN_CLAMP = 50.0  # km/时间单位，给地速一个更保守下限（避免数值不稳）
+
+    while openh:
+        _, u_node = heappop(openh)
+        if u_node in closed:
+            continue
+        closed.add(u_node)
+
+        if u_node == goal:
+            path = []
+            cur = u_node
+            while cur is not None:
+                path.append(cur)
+                cur = parent[cur]
+            path.reverse()
+            return path, g[u_node], g_dist[u_node], closed
+
+        ux, uy, uz = u_node
+        # 当前格点水平风（km/时间单位）
+        u_wind, v_wind = get_wind_uv(ux, uy, uz)
+
+        for nx, ny, nz, dist_km, east_km, north_km in neighbors(ux, uy, uz, mask):
+            v_node = (nx, ny, nz)
+
+            # 水平航向单位向量（物理 EN 平面）
+            horiz_norm = math.hypot(east_km, north_km)
+            if horiz_norm < EPS:
+                # 纯垂直移动：忽略风的投影影响
+                Vg = TAS
+            else:
+                ex = east_km / horiz_norm
+                ey = north_km / horiz_norm
+                Vg = TAS + (u_wind * ex + v_wind * ey)
+
+            Vg = max(EPS, Vg)
+            Vg = max(VMIN_CLAMP, Vg)
+
+            time_edge = dist_km / Vg
+            edge_cost = 0.5 * dist_km + 0.5 * time_edge
+
+            new_g = g[u_node] + edge_cost
+
+            if v_node not in g or new_g < g[v_node]:
+                g[v_node] = new_g
+                g_dist[v_node] = g_dist[u_node] + dist_km
+                parent[v_node] = u_node
+                f_cost = new_g + heuristic(v_node, goal)
+                heappush(openh, (f_cost, v_node))
+
+    return None, np.inf, np.inf, closed
+
+# -----------------------------
+# 规划（有禁飞 & 无禁飞）
+# -----------------------------
+start_point, goal_point = random_free_cell(blocked, min_dist=5)
+path_obs,  cost_obs,  dist_obs,  explored = astar_3d(start_point, goal_point, blocked)
+empty_mask = np.zeros_like(blocked, dtype=bool)
+path_free, cost_free, dist_free, _       = astar_3d(start_point, goal_point, empty_mask)
+
+# -----------------------------
+# 可视化
+# -----------------------------
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_title("3D A*: Distance+Time in Physical Units with Layered Wind & Latitudinal Jet & Spherical No-fly")
+
+# 画球体禁飞区（索引球 -> 物理表面）
+u_mesh = np.linspace(0, np.pi, 15)
+v_mesh = np.linspace(0, 2 * np.pi, 30)
+uu, vv = np.meshgrid(u_mesh, v_mesh)
+for cx, cy, cz, r in spheres_idx:
+    Xs = cx + r * np.sin(uu) * np.cos(vv)
+    Ys = cy + r * np.sin(uu) * np.sin(vv)
+    Zs = cz + r * np.cos(uu)
+    ax.plot_surface(idx_to_phys_x(Xs), idx_to_phys_y(Ys), idx_to_phys_z(Zs),
+                    alpha=0.28, linewidth=0, cmap='Reds')
+
+# （可选）显示抽样的探索节点
+if path_obs:
+    ex = list(explored)
+    if len(ex) > 1000:
+        ex = random.sample(ex, 1000)
+    ax.scatter([idx_to_phys_x(x) for x, y, z in ex],
+               [idx_to_phys_y(y) for x, y, z in ex],
+               [idx_to_phys_z(z) for x, y, z in ex],
+               s=3, c='gray', alpha=0.12, label="Explored Nodes")
+
+# 无禁飞参考路径（虚线）
+if path_free:
+    ax.plot([idx_to_phys_x(x) for x, y, z in path_free],
+            [idx_to_phys_y(y) for x, y, z in path_free],
+            [idx_to_phys_z(z) for x, y, z in path_free],
+            linestyle='--', linewidth=2,
+            label=f"Free-space (cost={cost_free:.2f}, dist={dist_free:.1f} km)")
+
+# 有禁飞路径（实线）
+if path_obs:
+    ax.plot([idx_to_phys_x(x) for x, y, z in path_obs],
+            [idx_to_phys_y(y) for x, y, z in path_obs],
+            [idx_to_phys_z(z) for x, y, z in path_obs],
+            linewidth=3,
+            label=f"With spheres (cost={cost_obs:.2f}, dist={dist_obs:.1f} km)")
+
+# 起终点
+sx, sy, sz = start_point
+gx, gy, gz = goal_point
+ax.scatter([idx_to_phys_x(sx)], [idx_to_phys_y(sy)], [idx_to_phys_z(sz)],
+           s=60, marker='o', label='Start', color='green', depthshade=False)
+ax.scatter([idx_to_phys_x(gx)], [idx_to_phys_y(gy)], [idx_to_phys_z(gz)],
+           s=80, marker='*', label='Goal', color='purple', depthshade=False)
+
+ax.set_xlabel("Longitude (deg)")
+ax.set_ylabel("Latitude (deg)")
+ax.set_zlabel("Flight level (ft)")
+ax.legend(loc='upper left',
+          title=f"TAS={TAS:.0f} km/tu | Jet: A={A_JET:.0f}, y0={Y0_JET:.1f}, σ={SIGMA_JET:.1f}")
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 数值对比（节省/增加百分比）
+# -----------------------------
+if path_obs and path_free and dist_free > 0 and cost_free > 0:
+    increase_dist = (dist_obs - dist_free) / dist_free * 100
+    increase_cost = (cost_obs - cost_free) / cost_free * 100
+    print(f"Free-space Path: Cost={cost_free:.2f}, Distance={dist_free:.1f} km")
+    print(f"Obstacle Path:   Cost={cost_obs:.2f} (+{increase_cost:.1f}%), Distance={dist_obs:.1f} km ({increase_dist:+.1f}% longer)")
+
+# —— 物理球面距离（km）
+EARTH_RADIUS_KM = 6371.0
+def haversine_km(lon1, lat1, lon2, lat2):
+    rlat1 = math.radians(lat1); rlat2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(rlat1)*math.cos(rlat2)*math.sin(dlon/2)**2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+def phys_km_between(a, b):
+    lon1, lat1 = idx_to_phys_x(a[0]), idx_to_phys_y(a[1])
+    lon2, lat2 = idx_to_phys_x(b[0]), idx_to_phys_y(b[1])
+    return haversine_km(lon1, lat1, lon2, lat2)
+
+# —— 取“朝向最终目标的 900km 子目标”（若剩余不足900则直接终点）
+def choose_window_goal(current, final_goal, window_km, mask, max_snap=4):
+    total_km = phys_km_between(current, final_goal)
+    if total_km <= window_km:
+        return final_goal
+    t = window_km / total_km
+    xf = current[0] + t * (final_goal[0] - current[0])
+    yf = current[1] + t * (final_goal[1] - current[1])
+    zf = current[2] + t * (final_goal[2] - current[2])
+    # 就近贴回可通行网格
+    xi, yi, zi = int(round(xf)), int(round(yf)), int(round(zf))
+    for r in range(max_snap+1):
+        for dx in range(-r, r+1):
+            for dy in range(-r, r+1):
+                for dz in range(-r, r+1):
+                    nx, ny, nz = xi+dx, yi+dy, zi+dz
+                    if in_bounds(nx, ny, nz) and passable(nx, ny, nz, mask):
+                        return (nx, ny, nz)
+    return final_goal
+
+# —— 计算从 u->v 这一步的“模型时间”（与 A* 保持一致的近似，物理单位）
+def step_time_units(u_node, v_node):
+    ux, uy, uz = u_node
+    vx, vy, vz = v_node
+    dist_km = phys3d_km_between(u_node, v_node)
+
+    east_km, north_km = east_north_km_between(ux, uy, vx, vy)
+    EPS = 1e-6
+    horiz_norm = math.hypot(east_km, north_km)
+
+    u_wind, v_wind = get_wind_uv(ux, uy, uz)
+    if horiz_norm < EPS:
+        Vg = TAS
+    else:
+        ex = east_km / horiz_norm
+        ey = north_km / horiz_norm
+        Vg = TAS + (u_wind * ex + v_wind * ey)
+
+    Vg = max(50.0, Vg)  # 与 A* 中的 VMIN_CLAMP 保持一致
+    return dist_km / Vg
+
+# —— 按“飞行固定时长”沿路径前进（严格不超时）
+def advance_along_path_by_time(path, time_budget_units):
+    """
+    返回:
+      step_idx: 在 path 上的停留索引（不跨越会超时的下一条边）
+      used:     实际消耗的时间
+      reached_end: 是否到达 path 终点（子目标）
+    """
+    if not path or len(path) < 2 or time_budget_units <= 0:
+        return 0, 0.0, len(path) <= 1
+
+    used = 0.0
+    for i in range(len(path) - 1):
+        dt = step_time_units(path[i], path[i + 1])
+        if used + dt > time_budget_units:
+            return i, used, False
+        used += dt
+    return len(path) - 1, used, True
+
+# —— 主循环：窗口=900km；一小时内可多次重规划
+WINDOW_KM = 900.0
+
+# 设定“模型时间单位”对应的小时数
+TIME_UNIT_HOURS = 1.0
+ONE_HOUR_IN_TIME_UNITS = 1.0 / TIME_UNIT_HOURS  # 1 小时等于多少“模型时间单位”
+
+def rolling_plan_by_hour(start, final_goal, mask, max_hours=1000, verbose=True):
+    """
+    每个外层循环代表“消耗最多 1 小时”。这一小时内可多次：
+      选 900km 子目标 -> A* -> 在剩余时间内推进 -> 若提前到子目标继续下一段
+    """
+    curr = start
+    traj = [curr]
+    hours_acc = 0.0
+    hour_idx = 0
+    EPS = 1e-9
+
+    while curr != final_goal and hour_idx < max_hours:
+        hour_idx += 1
+        remaining = ONE_HOUR_IN_TIME_UNITS
+        inner_calls = 0
+
+        while remaining > EPS and curr != final_goal:
+            inner_calls += 1
+
+            # 选择 900km 子目标（或不足 900km 时直接用最终目标）
+            subgoal = choose_window_goal(curr, final_goal, WINDOW_KM, mask)
+            path, cost, dist, _ = astar_3d(curr, subgoal, mask)
+            if not path:
+                print(f"[终止] 无法从 {curr} 规划至 {subgoal}。")
+                return traj, hours_acc
+
+            step_idx, used, reached_subgoal = advance_along_path_by_time(path, remaining)
+
+            # 沿当前段推进（不重复起点）
+            if step_idx >= 1:
+                traj.extend(path[1:step_idx + 1])
+                curr = path[step_idx]
+
+            remaining -= used
+
+            if verbose:
+                print(f"  ├─ 段内第 {inner_calls} 次：耗时 {used:.3f} tu，"
+                      f"到达 {curr}，距终点 {phys_km_between(curr, final_goal):.1f} km，"
+                      f"小时剩余 {remaining:.3f} tu")
+
+            # 防死循环：预算太小连下一条边都过不去
+            if used <= EPS and not reached_subgoal:
+                if verbose:
+                    print("  └─ 剩余预算不足以通过下一条边，提前结束本小时。")
+                break
+
+        hours_acc += 1.0
+        if verbose:
+            print(f"[{hour_idx:02d}] 本小时结束：位置 {curr}，距终点 ~{phys_km_between(curr, final_goal):.1f} km")
+
+    if curr == final_goal:
+        print("[完成] 抵达终点。")
+
+    return traj, hours_acc
+
+# —— 运行滚动规划（以“有禁飞”的图为例）
+rolling_traj, hours_flown = rolling_plan_by_hour(start_point, goal_point, blocked)
+
+# —— 可视化滚动轨迹（追加一条线）
+if rolling_traj and len(rolling_traj) > 1:
+    ax.plot([idx_to_phys_x(x) for x,y,z in rolling_traj],
+            [idx_to_phys_y(y) for x,y,z in rolling_traj],
+            [idx_to_phys_z(z) for x,y,z in rolling_traj],
+            linewidth=2, alpha=0.9, label="Rolling 900km / ≤1h multi-replan")
+    ax.legend(loc='upper left')
+    plt.tight_layout()
+    plt.show()
