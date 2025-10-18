@@ -191,16 +191,16 @@ def find_optimal_weights_for_leg(start_node, end_node, mask, t_hour=0):
     """
         Performs a Pareto scan for a given flight leg and returns the optimal weights.
     """
-    weights_to_test = [(w/10.0, 1.0-w/10.0) for w in range(11)]
+    weights_to_test = [(w / 10.0, 1.0 - w / 10.0) for w in range(11)]
     results = []
     for wD, wT in weights_to_test:
         path, dist, time = astar_3d(start_node, end_node, mask, wD, wT, t_hour)
-        if path: results.append({'wD':wD,'wT':wT,'dist':dist,'time':time})
-    if not results: return (0.5, 0.5)
-    results.sort(key=lambda r:r['dist'])
-    pareto_points = np.array([[r['dist'],r['time']] for r in results])
+        if path: results.append({'wD': wD, 'wT': wT, 'dist': dist, 'time': time})
+    if not results: return (0.5, 0.5, [])
+    results.sort(key=lambda r: r['dist'])
+    pareto_points = np.array([[r['dist'], r['time']] for r in results])
     knee_idx = find_knee_point(pareto_points)
-    return (results[knee_idx]['wD'], results[knee_idx]['wT'])
+    return (results[knee_idx]['wD'], results[knee_idx]['wT'], results)
 
 # =========================
 # Main Simulation Loop
@@ -210,6 +210,7 @@ start_point, goal_point = random_free_cell(blocked, min_dist_km=1000.0)
 
 dynamic_segments, current_pos, hour = [], start_point, 0
 weights_history = []
+all_pareto_data = {}
 prev_wD, prev_wT = 0.5, 0.5
 alpha = 0.6  # Inertia factor for weight smoothing
 """
@@ -222,15 +223,16 @@ avoiding drastic and unstable changes in flight path caused by short-term foreca
 """
 
 
-print("\n--- Dynamic Pareto–Knee Flight Simulation (v5) ---")
+print("\n--- Dynamic Pareto–Knee Flight Simulation ---")
 while hour < TOTAL_SIM_HOURS and current_pos != goal_point:
     hour += 1
     print(f"\n[Hour {hour}] Re-planning from {current_pos}...")
-    new_wD, new_wT = find_optimal_weights_for_leg(current_pos, goal_point, blocked, t_hour=hour)
+    new_wD, new_wT, results = find_optimal_weights_for_leg(current_pos, goal_point, blocked, t_hour=hour)
     wD = alpha*prev_wD + (1-alpha)*new_wD
     wT = 1 - wD
     prev_wD, prev_wT = wD, wT
     weights_history.append((hour, wD, wT))
+    all_pareto_data[hour] = {'results': results, 'knee': (new_wD, new_wT)}
     print(f"  → Dynamic weights: (wD={wD:.2f}, wT={wT:.2f})")
     full_path, _, _ = astar_3d(current_pos, goal_point, blocked, wD, wT, t_hour=hour)
     if not full_path:
@@ -355,6 +357,34 @@ if weights_history:
     plt.xlabel("Hour"); plt.ylabel("Weight Value")
     plt.title("Dynamic Weight Evolution Over Time")
     plt.legend(); plt.grid(True); plt.show()
+
+
+# =========================
+# Pareto 前沿曲线绘图
+# =========================
+num_hours = len(all_pareto_data)
+fig, axes = plt.subplots(1, num_hours, figsize=(5*num_hours,5))
+if num_hours == 1:
+    axes = [axes]
+for i, hour in enumerate(sorted(all_pareto_data.keys())):
+    ax = axes[i]
+    data = all_pareto_data[hour]['results']
+    if not data:
+        ax.set_title(f"Hour {hour}: No data"); continue
+    dists = [r['dist'] for r in data]
+    times = [r['time'] for r in data]
+    knee_wD, knee_wT = all_pareto_data[hour]['knee']
+    ax.plot(dists, times, 'o--', color='gray', alpha=0.7)
+    knee_idx = find_knee_point(np.column_stack((dists, times)))
+    ax.plot(dists[knee_idx], times[knee_idx], 'r*', markersize=15, label=f"Knee (wD={knee_wD:.2f})")
+    ax.set_xlabel("Distance (km)")
+    ax.set_ylabel("Time (h)")
+    ax.set_title(f"Hour {hour} Pareto Frontier")
+    ax.legend()
+plt.suptitle("Distance–Time Pareto Frontiers with Knee Points (Each Hour)")
+plt.tight_layout()
+plt.show()
+
 
 # =========================
 # 数值对比（报告可直接引用）
