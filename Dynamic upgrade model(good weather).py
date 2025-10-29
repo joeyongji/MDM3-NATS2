@@ -416,7 +416,7 @@ def path_lon_lat_alt(path):
 
 fig = plt.figure(figsize=(11,8))
 ax = fig.add_subplot(111, projection='3d')
-ax.set_title("Dynamic 3D Route (Hourly Real Wind)\nPareto–Knee Per Hour")
+ax.set_title("Dynamic A Flight Path Optimization under Time-Varying Wind Fields \n using Pareto–Knee Adaptive Weighting")
 
 # 画禁飞球
 u_mesh = np.linspace(0, np.pi, 20)
@@ -602,3 +602,44 @@ if weights_history:
     plt.grid(True)
     plt.legend()
     plt.show()
+
+# =========================
+# 动态模型的总距离 / 总时间 / 成本统计
+# =========================
+dyn_dist = 0.0
+dyn_time = 0.0
+
+for seg_i, seg in enumerate(dynamic_segments):
+    used_tstamp = times_sorted[min(seg_i, len(times_sorted)-1)]
+
+    for n in range(1, len(seg)):
+        p1, p2 = seg[n-1], seg[n]
+        d_km = phys3d_km_between(p1, p2)
+
+        # 风速修正地速
+        ux, uy, uz = p1
+        alt_ft_here = idx_to_alt(uz)
+        u_kmh, v_kmh = get_wind_uv_kmh(ux, uy, alt_ft_here, used_tstamp)
+        east_km, north_km = east_north_km_between(p1[0], p1[1], p2[0], p2[1])
+        horiz = math.hypot(east_km, north_km)
+
+        if horiz < 1e-6:
+            Vg = TAS
+        else:
+            ex = east_km / horiz
+            ey = north_km / horiz
+            Vg = TAS + (u_kmh * ex + v_kmh * ey)
+
+        Vg = max(VMIN, Vg)
+        t_edge = d_km / Vg  # 该小段耗时
+
+        dyn_dist += d_km
+        dyn_time += t_edge
+
+# =========================
+# 成本与对比结果
+# =========================
+print("\n=== [Dynamic Model Summary] ===")
+print(f"Total Distance  = {dyn_dist:.1f} km")
+print(f"Total Time      = {dyn_time:.2f} h")
+print("===============================")

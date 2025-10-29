@@ -11,7 +11,7 @@ import random
 # =========================
 # 读取真实风场数据（Excel）
 # =========================
-excel_path = "/Users/ivy/Desktop/MDM3-NATS2/windfield_20250725.csv"  # 如果路径不同请改这里
+excel_path = "/Users/ivy/Desktop/windfield/windfield_20250725.csv"  # 如果路径不同请改这里
 df = pd.read_csv(excel_path)
 
 # df 需要包含列：
